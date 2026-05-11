@@ -182,6 +182,137 @@ from authlib.integrations.requests_client import OAuth2Session  # example family
 # fetch discovery, parse ID token with JWKS, validate claims
 ```
 
+### Example walkthrough: React SPA + FastAPI + Google (OIDC)
+
+End-to-end picture when **your users log into your product** with Google. Here FastAPI is the **OAuth client** (confidential): it keeps **`client_secret`** off the React bundle and completes the **authorization code** flow server-side. React is mostly the **user-agent** driving redirects and then calling your API with cookies.
+
+#### One-time Google Cloud setup
+
+1. Create a **Google Cloud** project → **APIs & Services** → **Credentials** → **Create credentials** → **OAuth client ID**.
+2. Application type **Web application**. Add **Authorized redirect URIs** exactly matching your backend callback, e.g. `https://api.example.com/auth/google/callback` (not the React dev server URL unless you intentionally proxy).
+3. Note **Client ID** and **Client secret**. Restrict OAuth consent screen (external vs internal) as appropriate.
+
+#### Scopes for “login only”
+
+Use at least **`openid email profile`** so the token response includes an **ID Token** with stable **`sub`** and usual profile/email claims. Add Google API scopes only if you need Gmail/Drive etc.
+
+#### Components
+
+| Piece | Role |
+|-------|------|
+| **React** (`https://app.example.com`) | UI; sends browser to FastAPI to start login; after login, stores **no secrets**; calls FastAPI with **`credentials: 'include'`** so session cookies are sent |
+| **FastAPI** (`https://api.example.com`) | **OAuth/OIDC client**: builds `/authorize` URL, stores **`state`** (and optional **`nonce`**) server-side, **`POST /token`** with `code` + secret, **verifies `id_token`**, creates **session**, sets **httpOnly** cookie |
+| **Google** | **Authorization server** + **OpenID Provider** |
+
+#### Happy-path steps
+
+1. User clicks **“Continue with Google”** in React → browser navigates to **`GET https://api.example.com/auth/google/login`** (full page navigation or `window.location.assign`).
+2. FastAPI generates cryptographically random **`state`** and **`nonce`**, stores them (signed cookie, Redis, or server session) tied to the browser, then responds **`302`** to Google’s **`/authorize`** with `client_id`, `redirect_uri` (FastAPI callback URL), `response_type=code`, `scope=openid email profile`, `state`, `nonce`, `prompt=consent` only if you need it.
+3. User signs in and consents on **Google**.
+4. Google redirects browser to **`GET https://api.example.com/auth/google/callback?code=...&state=...`**.
+5. FastAPI validates **`state`**, exchanges **`code`** at Google’s **`POST /token`** with `client_id`, **`client_secret`**, `redirect_uri`, `grant_type=authorization_code`.
+6. Response includes **`id_token`**, **`access_token`**, optional **`refresh_token`**. FastAPI **verifies `id_token`** (JWKS signature, `iss`, `aud`, `exp`, **`nonce`**).
+7. FastAPI maps **`sub`** (+ email if you trust `email_verified`) to an internal user row or creates one, then sets a **session** (opaque **session id** in **httpOnly** `Secure` `SameSite` cookie, or a signed session JWT cookie—your choice).
+8. FastAPI responds **`302`** to **`https://app.example.com/app`** (or `/login/success`). React loads; user is logged in for your domain because of the **cookie on `api.example.com`** (see CORS note below).
+9. React calls **`GET https://api.example.com/me`** with `fetch(url, { credentials: 'include' })`; FastAPI reads session, returns JSON user.
+
+#### Cookie + CORS reality
+
+Browser cookies are **domain-scoped**. If the session cookie is set on **`api.example.com`**, it is **not** sent to **`app.example.com`**. Typical fixes:
+
+- **Same site, API under a path**: serve API and SPA from one origin (e.g. reverse proxy: `example.com` + `/api` → FastAPI). Cookie on `example.com` works for both.
+- **Subdomains**: set cookie **`Domain=.example.com`** so both `app` and `api` receive it (still configure `Secure`, `SameSite=None` if cross-site rules apply—prefer same-site layouts to avoid third-party cookie issues).
+- **BFF**: React talks only to same-origin `/api` which proxies to FastAPI (cookie always first-party).
+
+#### Minimal React (start login + authenticated fetch)
+
+```tsx
+// Start login — full redirect so FastAPI can set state and redirect to Google
+function LoginWithGoogle() {
+  return (
+    <a href={`${import.meta.env.VITE_API_URL}/auth/google/login`}>
+      Continue with Google
+    </a>
+  );
+}
+
+// After login, call API with cookies
+async function fetchMe() {
+  const r = await fetch(`${import.meta.env.VITE_API_URL}/me`, {
+    credentials: "include",
+  });
+  if (!r.ok) throw new Error("not logged in");
+  return r.json();
+}
+```
+
+#### Minimal FastAPI (shape only — use Authlib or similar in production)
+
+```python
+# Pseudocode — real apps: authlib OAuth2Session, redis for state, HTTPS only
+
+@app.get("/auth/google/login")
+async def google_login():
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    # persist state+nonce (e.g. signed cookie or Redis keyed by state)
+    url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={CLIENT_ID}&redirect_uri={CALLBACK_URI}"
+        "&response_type=code&scope=openid%20email%20profile"
+        f"&state={state}&nonce={nonce}"
+    )
+    return RedirectResponse(url)
+
+@app.get("/auth/google/callback")
+async def google_callback(code: str, state: str):
+    # validate state matches stored value
+    token_response = await exchange_code_for_tokens(code)
+    id_token = token_response["id_token"]
+    claims = verify_google_id_token(id_token, nonce=expected_nonce)  # JWKS!
+    user = upsert_user(claims["sub"], claims.get("email"))
+    response = RedirectResponse(f"{FRONTEND_URL}/app")
+    response.set_cookie("session", create_session_token(user), httponly=True, secure=True, samesite="lax")
+    return response
+
+@app.get("/me")
+async def me(session: Session = Depends(get_session)):
+    return {"user_id": session.user_id, "email": session.email}
+```
+
+#### Diagram (browser redirect flow, confidential client)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User
+    participant React as React app
+    participant API as FastAPI
+    participant Google as Google IdP
+
+    User->>React: Click Continue with Google
+    React->>API: GET auth google login
+    API->>React: 302 to Google authorize state nonce
+    React->>Google: Browser follows redirect
+    Google->>User: Login consent
+    User->>Google: Approve
+    Google->>API: GET callback code state
+    API->>Google: POST token code plus secret
+    Google->>API: id_token access_token
+    API->>API: Verify id_token create session
+    API->>React: 302 to app plus Set-Cookie session
+    React->>API: GET me credentials include
+    API->>React: JSON user
+```
+
+#### Alternative: PKCE in the SPA
+
+React runs **`/authorize`** with PKCE and receives **`code`** on `localhost` or SPA redirect URI, then either exchanges tokens **in the browser** (tokens in JS memory/storage—risky for refresh tokens) or sends **`code`** to FastAPI which exchanges it (**BFF**). Confidential FastAPI-only redirect avoids storing refresh tokens in the SPA entirely.
+
+#### See also
+
+[FastAPI](./12-python-web-stack.md#fastapi), [Session](#session), [PKCE](#pkce-proof-key-for-code-exchange).
+
 ## PKCE (proof key for code exchange)
 
 **Yes — PKCE is part of OAuth 2.0.** It is defined in [RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636) as an extension used with the **authorization code** grant. It is **not** a second login step after “initial login”; it wraps the **same** redirect-to-IdP flow, adding crypto so whoever receives the `code` cannot exchange it unless they also have the original **`code_verifier`**.
