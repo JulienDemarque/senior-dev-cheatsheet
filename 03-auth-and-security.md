@@ -27,6 +27,20 @@ if not user.has_permission("invoice:write", invoice.org_id):
 
 **OAuth 2.0** is an *authorization* framework: clients obtain delegated **access token**s to call resource servers on a user’s behalf. It does **not** by itself standardize *who the user is*—that’s **OIDC**.
 
+### IdP (identity provider)
+
+Informal term for the system where users **sign in** and which mints tokens for your app. In practice your **IdP** is usually the same product as the OAuth **authorization server** and the OIDC **OpenID Provider** (e.g. Google, Auth0, Okta). “IdP” is not a separate OAuth role—it’s what people call that vendor **as a whole**.
+
+### “Google Auth” — is that the resource server?
+
+**No.** The account picker / consent screen and the **`/authorize`** + **`/token`** endpoints are the **authorization server** (and, with OIDC, the **OpenID Provider**). That’s what most people mean by **“Google Auth.”**
+
+A **resource server** is an **HTTP API that consumes access tokens**—e.g. **Gmail API**, **Google Drive API**. You use the **access token** from the token response to call those APIs **on the user’s behalf** (delegated **authorization** to read mail, files, etc.).
+
+For **“Sign in with Google” only** (no Gmail/Drive calls), you often care about **`id_token`** + OIDC claims (**who** the user is) and then create your own **session**. The **OAuth** machinery (code, token endpoint, **access_token**) is still the same pipeline; **identity** comes from the **OIDC** layer (`id_token`, `openid` scope, sometimes **UserInfo**), not from OAuth’s original “access token only” story.
+
+So: you are not using “authorization instead of authentication” in a vacuum—**real products combine OAuth’s flow with OIDC (or similar) for login**, while **access_token** remains the thing meant for **calling APIs** (Google’s or yours).
+
 RFC-ish actors (same party can be split across processes in real apps):
 
 | Actor | Typical deployment |
@@ -34,8 +48,24 @@ RFC-ish actors (same party can be split across processes in real apps):
 | **Resource owner** | End user |
 | **User-agent** | Browser / mobile WebView |
 | **Client** | Your SPA, mobile app, or **backend** that holds `client_secret` (confidential) |
-| **Authorization server** | IdP login + consent + `/authorize` + `/token` |
+| **Authorization server** | IdP: login UI + consent + **`/authorize`** + **`/token`** (e.g. **Google** Identity, **Auth0**, **Okta**, **Azure AD**, **Keycloak**) |
 | **Resource server** | Your API (or third-party API) that accepts the **access token** |
+
+When you use **“Sign in with Google”** (OAuth/OIDC), **Google is the authorization server** for that flow: the Google account screen and the endpoints that mint the **`code`** and **tokens** are all that role. If you then call **Google APIs** (Gmail, Drive, Calendar), those APIs act as **resource servers** that accept Google-issued **access tokens** (with the right scopes). Your own backend API can also be a **resource server** for tokens your own IdP issued.
+
+### Client (e.g. your backend) vs resource server
+
+They are **different OAuth roles**, not necessarily different machines.
+
+| | **Client** (confidential = your backend) | **Resource server** (your API or Google’s API) |
+|---|-------------------------------------------|--------------------------------------------------|
+| **Job** | Talks to the **authorization server**: redirect / `code` exchange, `client_id` + **`client_secret`** (or PKCE), receives **tokens** | **Protects resources**: incoming requests must carry a valid **access token**; checks signature / introspection, **scopes**, audience |
+| **Typical routes** | `/login`, `/oauth/callback`, token refresh logic | `/api/...` returning business data |
+| **Calls** | `POST` to IdP **`/token`**; may then call resource servers with `Authorization: Bearer …` | Does **not** run the Google login page; validates **Bearer** tokens **presented to it** |
+
+**Same codebase can be both:** one process might expose `/auth/callback` (acting as **client**) and `/api/invoices` (acting as **resource server** for your own JWTs or tokens from your IdP). In **microservices**, a **BFF** is often the **client** to the IdP, while inner services are **resource servers** that trust tokens the BFF or gateway forwards.
+
+If your product is only “Sign in with Google then **session cookie**,” your backend is mainly the **client** toward Google; your **HTML pages** are not really an OAuth resource server until you expose an API that expects **Bearer** access tokens.
 
 ### Example (authorization code flow — roles)
 
@@ -154,7 +184,26 @@ from authlib.integrations.requests_client import OAuth2Session  # example family
 
 ## PKCE (proof key for code exchange)
 
-For **public clients** (SPA, mobile) that cannot hold a `client_secret`. Generate random `code_verifier`, send `code_challenge = BASE64URL(SHA256(verifier))` on `/authorize`, send `code_verifier` on `/token`. Prevents stolen `code` from being exchanged without the original app instance.
+**Yes — PKCE is part of OAuth 2.0.** It is defined in [RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636) as an extension used with the **authorization code** grant. It is **not** a second login step after “initial login”; it wraps the **same** redirect-to-IdP flow, adding crypto so whoever receives the `code` cannot exchange it unless they also have the original **`code_verifier`**.
+
+### Where it sits in time (one sign-in, end-to-end)
+
+Think of it as **extra query/body parameters** on the two HTTP hops you already had for authorization code:
+
+1. **Before redirecting the browser** — your app (usually the SPA or native shell) generates **`code_verifier`** (long random secret) and derives **`code_challenge`** = BASE64URL(SHA256(verifier)). It keeps **`code_verifier` in memory** (or secure storage), never sends it on the first hop.
+2. **`GET /authorize`** — same as OAuth auth code, **plus** `code_challenge` and `code_challenge_method=S256` (with `client_id`, `redirect_uri`, `scope`, `state`, `response_type=code`). User signs in and consents **here** (that *is* the “login” from OAuth’s point of view).
+3. **Redirect back** — same as without PKCE: `?code=...&state=...`.
+4. **`POST /token`** — same endpoint as confidential clients, but the client sends **`code_verifier`** (and **no** `client_secret` for a public client). The IdP recomputes SHA256(verifier), compares to the challenge from step 2, then returns **`access_token`** (and optionally **`refresh_token`**, **`id_token`** if OIDC).
+
+So PKCE runs **during** the first code exchange, **not** after you already have a session or access token. **Refresh token** grants are a **separate** later call (`grant_type=refresh_token`); PKCE does not repeat on every refresh unless your stack does a full new authorization (unusual for simple refresh).
+
+### Why it exists
+
+Without a **client secret**, an attacker who intercepts the **`code`** (open redirect, HTTP mitm, etc.) could call **`/token`** and impersonate the user. PKCE binds the **`code`** to the same instance that started **`/authorize`** by requiring the secret **`code_verifier`** at token time.
+
+### Confidential client with secret
+
+If your **backend** holds `client_secret` and exchanges the code server-side, you often still **use PKCE anyway** (defense in depth, BFF pattern, or policy). The critical case is **public clients** where PKCE is effectively **required** by modern practice.
 
 ### Example (values abbreviated)
 
