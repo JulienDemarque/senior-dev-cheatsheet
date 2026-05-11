@@ -27,6 +27,16 @@ if not user.has_permission("invoice:write", invoice.org_id):
 
 **OAuth 2.0** is an *authorization* framework: clients obtain delegated **access token**s to call resource servers on a user’s behalf. It does **not** by itself standardize *who the user is*—that’s **OIDC**.
 
+RFC-ish actors (same party can be split across processes in real apps):
+
+| Actor | Typical deployment |
+|-------|---------------------|
+| **Resource owner** | End user |
+| **User-agent** | Browser / mobile WebView |
+| **Client** | Your SPA, mobile app, or **backend** that holds `client_secret` (confidential) |
+| **Authorization server** | IdP login + consent + `/authorize` + `/token` |
+| **Resource server** | Your API (or third-party API) that accepts the **access token** |
+
 ### Example (authorization code flow — roles)
 
 1. Browser → your app → redirect to IdP `/authorize?response_type=code&client_id=...&redirect_uri=...&scope=...&state=...`
@@ -34,9 +44,88 @@ if not user.has_permission("invoice:write", invoice.org_id):
 3. Your backend `POST /token` with `code`, `client_id`, `client_secret` (confidential client) or **PKCE** (public client)
 4. You receive **access token** (and often **refresh token**); call APIs or establish **session**
 
+### Sequence diagram — authorization code (confidential client)
+
+`client_secret` stays on the **server**. The browser never sees it. After step 9 you usually create a **session** cookie or store tokens server-side.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor RO as Resource owner
+    participant UA as User-agent<br/>(browser)
+    participant C as Client<br/>(your backend)
+    participant AS as Authorization server<br/>(IdP)
+    participant RS as Resource server<br/>(API)
+
+    RO->>UA: Open your app
+    UA->>C: GET /login (or click Sign in)
+    C->>UA: 302 redirect to AS /authorize<br/>client_id, redirect_uri, scope, state
+    UA->>AS: GET /authorize
+    AS->>RO: Login + consent screen
+    RO->>AS: Approve
+    AS->>UA: 302 redirect to redirect_uri<br/>?code=...&state=...
+    UA->>C: GET /callback?code=...&state=...<br/>(C validates state)
+    C->>AS: POST /token<br/>grant_type=authorization_code<br/>code, client_id, client_secret, redirect_uri
+    AS->>C: JSON access_token (+ refresh_token)
+    C->>RS: HTTPS API call<br/>Authorization Bearer access_token
+    RS->>C: 200 + protected resource
+```
+
+### Sequence diagram — authorization code + PKCE (public client)
+
+Typical for **SPA or native app**: no `client_secret`. The **code_verifier** proves the same app instance that started the flow exchanges the code. Many production SPAs use a **BFF** (backend-for-frontend) instead so tokens never sit in browser storage—then the middle steps look like the confidential diagram with a thin “token exchange” backend.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor RO as Resource owner
+    participant UA as User-agent<br/>(browser / SPA)
+    participant AS as Authorization server<br/>(IdP)
+
+    Note over UA: Store code_verifier;<br/>send code_challenge on authorize
+
+    UA->>AS: GET /authorize<br/>+ code_challenge (S256) + state
+    AS->>RO: Login + consent
+    RO->>AS: Approve
+    AS->>UA: 302 redirect_uri?code=...&state=...
+    UA->>AS: POST /token<br/>code + code_verifier + client_id<br/>(no client_secret)
+    AS->>UA: access_token (+ refresh_token)
+```
+
 ## OIDC (OpenID Connect)
 
 Identity layer on top of OAuth 2.0: adds **`openid` scope**, **ID Token** (always a **JWT** with `iss`, `aud`, `sub`, `exp`, `iat`, optional `nonce`), **UserInfo** endpoint, and discovery (`/.well-known/openid-configuration`). Use OIDC for “Sign in with Google/Auth0/Okta”; use raw OAuth when you only need API delegation without identity claims.
+
+### Sequence diagram — OIDC on the same OAuth flow
+
+Same `/authorize` → `code` → `/token` dance; the token response **adds** **`id_token`** (JWT) for **authentication** (who signed in). **`access_token`** may still be opaque or JWT used for **API authorization**. **UserInfo** is optional extra claims beyond the ID token.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor RO as Resource owner
+    participant UA as User-agent
+    participant C as Client<br/>(backend or BFF)
+    participant OP as OpenID provider<br/>(authorization server)
+
+    UA->>C: Start sign-in
+    C->>UA: 302 /authorize<br/>scope includes openid<br/>+ nonce + state (+ PKCE if public)
+    UA->>OP: GET /authorize
+    OP->>RO: Login + consent (openid)
+    RO->>OP: Approve
+    OP->>UA: 302 redirect code + state
+    UA->>C: callback with code
+    C->>OP: POST /token (code + secret or PKCE)
+    OP->>C: access_token + id_token + optional refresh_token
+
+    Note over C: Verify id_token JWT — JWKS, iss, aud, exp, nonce
+    Note over C: Map sub → local user / session
+
+    opt Extra claims not in id_token
+        C->>OP: GET /userinfo<br/>Authorization Bearer access_token
+        OP->>C: JSON claims
+    end
+```
 
 ### Example (ID token claims — illustrative)
 
