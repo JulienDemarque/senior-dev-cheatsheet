@@ -27,19 +27,44 @@ if not user.has_permission("invoice:write", invoice.org_id):
 
 **OAuth 2.0** is an *authorization* framework: clients obtain delegated **access token**s to call resource servers on a user’s behalf. It does **not** by itself standardize *who the user is*—that’s **OIDC**.
 
+### Hosted platforms (Auth0, Okta, Clerk, Amazon Cognito, …)
+
+Products like **Auth0** do **not** remove OAuth/OIDC concepts—they **implement** them for you and add UX and ops around them. What typically gets **easier**:
+
+- **Dashboard + APIs** for applications, callbacks URLs, and connection toggles (**Google**, GitHub, enterprise SAML, etc.).
+- **SDKs** (`@auth0/auth0-react`, Authlib, NextAuth patterns) that wrap redirects, **`state`/`nonce`**, and token handling—fewer chances to miswire URLs.
+- **Hosted Universal Login**: Auth0’s pages run the **`/authorize`** experience so you ship fewer custom login forms.
+- **Built-ins**: MFA policies, anomaly detection, brute-force mitigation, token rotation options—things you’d otherwise bolt on yourself.
+
+What **stays your responsibility** (any vendor):
+
+- Correct **redirect URIs**, **CORS**, and **cookie domains** between SPA and API.
+- Knowing whether you store **sessions** vs **Bearer tokens** in the browser and the tradeoffs.
+- **Secrets** (client secret for confidential apps), env separation, and validating **`id_token`** if you handle callbacks manually.
+
+So Auth0 **streamlines implementation** and reduces footguns; the **mental model** (authorization server, client, code exchange, `id_token` for login) is the same.
+
+### OAuth and OIDC vocabulary
+
+| Term | Meaning |
+|------|--------|
+| **Authorization code (`code`)** | Short-lived, single-use string returned by the IdP on **`redirect_uri`** after the user approves. **Not** the access token. Your server exchanges it at **`POST /token`** with `client_id` (+ secret or PKCE). Anyone who steals it before redemption might finish the flow—hence **HTTPS**, short TTL, **PKCE** on public clients, and **`state`**. |
+| **`state`** | **Opaque** random string **your client** generates before **`/authorize`** and stores (cookie/Redis). The IdP echoes it on redirect. You **must** compare callback `state` to stored value—binds the callback to the login your app started (**CSRF** mitigation). See [OAuth state checklist](#oauth-state-operational-checklist) below. |
+| **`nonce`** | Random string sent on **`/authorize`** (OIDC); must appear inside the **`id_token`** JWT when verified. Stops **replay**: an attacker cannot reuse an old **`id_token`** from another context as if it belonged to this login attempt. |
+| **Opaque (token)** | A token string whose **meaning is only known to the issuer**—usually verified by **introspection** (`POST /introspect`) or lookup server-side, not by decoding locally (contrast with **JWT**, self-contained if you have keys). “Opaque **`state`**” means “**meaningless blob** to everyone except your server,” not encrypted identity data. |
+| **CSRF (cross-site request forgery)** | Attacker tricks a victim’s browser into **submitting a request** the victim did **not** intend (often using the victim’s existing cookies/session). In OAuth, **`state`** ties the returning **`code`** to **your** login initiation so an attacker cannot complete **their** authorization under **your** session. |
+
 ### IdP (identity provider)
 
 Informal term for the system where users **sign in** and which mints tokens for your app. In practice your **IdP** is usually the same product as the OAuth **authorization server** and the OIDC **OpenID Provider** (e.g. Google, Auth0, Okta). “IdP” is not a separate OAuth role—it’s what people call that vendor **as a whole**.
 
-### “Google Auth” — is that the resource server?
+### Authorization server vs resource server (example: Google)
 
-**No.** The account picker / consent screen and the **`/authorize`** + **`/token`** endpoints are the **authorization server** (and, with OIDC, the **OpenID Provider**). That’s what most people mean by **“Google Auth.”**
+The Google account UI and the **`/authorize`** + **`/token`** endpoints are the **authorization server** (and, with OIDC, the **OpenID Provider**). That stack is what products usually mean by integrating **Google sign-in**.
 
-A **resource server** is an **HTTP API that consumes access tokens**—e.g. **Gmail API**, **Google Drive API**. You use the **access token** from the token response to call those APIs **on the user’s behalf** (delegated **authorization** to read mail, files, etc.).
+**Resource servers** are separate: HTTP APIs that **accept an access token** and enforce scopes—e.g. **Gmail API**, **Google Drive API**. The **access token** from the token response authorizes calls **on the user’s behalf** (reading mail, files, etc.).
 
-For **“Sign in with Google” only** (no Gmail/Drive calls), you often care about **`id_token`** + OIDC claims (**who** the user is) and then create your own **session**. The **OAuth** machinery (code, token endpoint, **access_token**) is still the same pipeline; **identity** comes from the **OIDC** layer (`id_token`, `openid` scope, sometimes **UserInfo**), not from OAuth’s original “access token only” story.
-
-So: you are not using “authorization instead of authentication” in a vacuum—**real products combine OAuth’s flow with OIDC (or similar) for login**, while **access_token** remains the thing meant for **calling APIs** (Google’s or yours).
+For **sign-in only** (no Gmail/Drive integration), applications typically rely on the **`id_token`** and OIDC claims (**who** the user is) and then create an **application session**. The same OAuth machinery applies (**`code`**, **`/token`**, **`access_token`**); **identity** for login comes from the **OIDC** layer (`id_token`, `openid` scope, optional **UserInfo**). **access_token** is still the artifact meant for **calling APIs** (Google’s or your own).
 
 RFC-ish actors (same party can be split across processes in real apps):
 
@@ -304,6 +329,39 @@ sequenceDiagram
     React->>API: GET me credentials include
     API->>React: JSON user
 ```
+
+#### OAuth state (operational checklist)
+
+See **[OAuth and OIDC vocabulary](#oauth-and-oidc-vocabulary)** for definitions of **`state`**, **opaque**, and **CSRF**.
+
+**Who creates `state`:** The **OAuth client** (e.g. FastAPI **`/auth/google/login`**), never the IdP.
+
+**Who verifies:** The **same client** on the IdP redirect to **`/callback`** when the query string contains **`?code=...&state=...`**.
+
+**How:** Before **`/authorize`**, persist **`state`** (and usually **`nonce`**) so you can retrieve them when the browser returns:
+
+- **Signed or httpOnly cookie** on `GET /login` holding `state` / `nonce`, read back on callback.
+- **Server-side store** keyed by `state` (Redis) with TTL ~10 minutes: `{ state → nonce, optional metadata }`.
+- **Encrypted state blob** in the callback URL (less common).
+
+On callback: parse `state`; **reject** if missing, unknown, or expired; **compare** to stored value for **this** login attempt. On match, delete one-time entry (**replay** protection). On failure → **`400`** / redirect to login—do **not** exchange the **`code`**.
+
+**Why:** Mitigates **CSRF / login confusion** (binding the returning **`code`** to the session that **started** OAuth).
+
+#### Session cookie vs storing Google’s `id_token`
+
+**Usually the cookie is not Google’s `id_token`.** Google’s **`id_token`** is a **JWT from Google** for **one-time verification** at **`/token`** time: validate signature (JWKS), **`aud`** (your client id), **`exp`**, **`nonce`**, then read **`sub`** / email and **issue your own session**.
+
+Typical patterns for the **`Set-Cookie`** your API returns:
+
+| Cookie contents | Meaning |
+|-----------------|--------|
+| **Opaque session id** | Random id; server looks up Redis/DB for `user_id`, expiry, roles. Common when you want easy revocation and logout. |
+| **JWT signed by your app** | Claims like `{ "uid": "...", "exp": ... }` signed with **your** secret or asymmetric key—not Google’s key. Lets APIs verify without DB hit; revocation needs short TTL plus denylist or accept staleness. |
+
+Storing Google’s raw **`id_token`** in a browser cookie is **unusual**: short-lived (~1h), minted for **your OAuth client** as OIDC proof, not designed as your long-lived API session. If you need Google **`access_token`** later (Calendar, Gmail), store **refresh/exchange logic server-side**, not only in the cookie.
+
+**Summary:** **`id_token`** proves identity **once** when you finish OAuth; your **session cookie** proves identity **on each request** to **your** API—often a **different** token or opaque id, **issued by you** after you trust Google’s **`id_token`**.
 
 #### Alternative: PKCE in the SPA
 
