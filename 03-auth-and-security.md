@@ -52,23 +52,23 @@ RFC-ish actors (same party can be split across processes in real apps):
 sequenceDiagram
     autonumber
     actor RO as Resource owner
-    participant UA as User-agent<br/>(browser)
-    participant C as Client<br/>(your backend)
-    participant AS as Authorization server<br/>(IdP)
-    participant RS as Resource server<br/>(API)
+    participant UA as User-agent
+    participant C as Client backend
+    participant AS as Authorization server
+    participant RS as Resource server
 
     RO->>UA: Open your app
-    UA->>C: GET /login (or click Sign in)
-    C->>UA: 302 redirect to AS /authorize<br/>client_id, redirect_uri, scope, state
+    UA->>C: GET /login or Sign in
+    C->>UA: 302 to AS /authorize with client_id redirect_uri scope state
     UA->>AS: GET /authorize
-    AS->>RO: Login + consent screen
+    AS->>RO: Login and consent screen
     RO->>AS: Approve
-    AS->>UA: 302 redirect to redirect_uri<br/>?code=...&state=...
-    UA->>C: GET /callback?code=...&state=...<br/>(C validates state)
-    C->>AS: POST /token<br/>grant_type=authorization_code<br/>code, client_id, client_secret, redirect_uri
-    AS->>C: JSON access_token (+ refresh_token)
-    C->>RS: HTTPS API call<br/>Authorization Bearer access_token
-    RS->>C: 200 + protected resource
+    AS->>UA: 302 to redirect_uri with code and state
+    UA->>C: GET /callback code state then validate state
+    C->>AS: POST /token authorization_code plus secret
+    AS->>C: JSON access_token and refresh_token
+    C->>RS: HTTPS API Authorization Bearer access_token
+    RS->>C: 200 protected resource
 ```
 
 ### Sequence diagram — authorization code + PKCE (public client)
@@ -79,17 +79,18 @@ Typical for **SPA or native app**: no `client_secret`. The **code_verifier** pro
 sequenceDiagram
     autonumber
     actor RO as Resource owner
-    participant UA as User-agent<br/>(browser / SPA)
-    participant AS as Authorization server<br/>(IdP)
+    participant UA as Browser or SPA
+    participant AS as Authorization server
 
-    Note over UA: Store code_verifier;<br/>send code_challenge on authorize
+    Note over UA: Store code_verifier for later token request
+    Note over UA: Send code_challenge S256 on authorize
 
-    UA->>AS: GET /authorize<br/>+ code_challenge (S256) + state
-    AS->>RO: Login + consent
+    UA->>AS: GET /authorize with code_challenge and state
+    AS->>RO: Login and consent
     RO->>AS: Approve
-    AS->>UA: 302 redirect_uri?code=...&state=...
-    UA->>AS: POST /token<br/>code + code_verifier + client_id<br/>(no client_secret)
-    AS->>UA: access_token (+ refresh_token)
+    AS->>UA: 302 redirect_uri with code and state
+    UA->>AS: POST /token with code code_verifier client_id no secret
+    AS->>UA: access_token and optional refresh_token
 ```
 
 ## OIDC (OpenID Connect)
@@ -105,24 +106,24 @@ sequenceDiagram
     autonumber
     actor RO as Resource owner
     participant UA as User-agent
-    participant C as Client<br/>(backend or BFF)
-    participant OP as OpenID provider<br/>(authorization server)
+    participant C as Client backend or BFF
+    participant OP as OpenID provider
 
     UA->>C: Start sign-in
-    C->>UA: 302 /authorize<br/>scope includes openid<br/>+ nonce + state (+ PKCE if public)
+    C->>UA: 302 /authorize scope openid nonce state optional PKCE
     UA->>OP: GET /authorize
-    OP->>RO: Login + consent (openid)
+    OP->>RO: Login and consent openid
     RO->>OP: Approve
-    OP->>UA: 302 redirect code + state
-    UA->>C: callback with code
-    C->>OP: POST /token (code + secret or PKCE)
-    OP->>C: access_token + id_token + optional refresh_token
+    OP->>UA: 302 redirect with code and state
+    UA->>C: Callback with code
+    C->>OP: POST /token with code secret or PKCE
+    OP->>C: access_token id_token optional refresh_token
 
-    Note over C: Verify id_token JWT — JWKS, iss, aud, exp, nonce
-    Note over C: Map sub → local user / session
+    Note over C: Verify id_token JWT JWKS iss aud exp nonce
+    Note over C: Map sub to local user or session
 
     opt Extra claims not in id_token
-        C->>OP: GET /userinfo<br/>Authorization Bearer access_token
+        C->>OP: GET /userinfo Bearer access_token
         OP->>C: JSON claims
     end
 ```
